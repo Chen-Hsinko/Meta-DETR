@@ -1,4 +1,5 @@
 import argparse
+import logging
 import datetime
 import json
 import random
@@ -12,6 +13,7 @@ from torch.utils.data import DataLoader
 
 import datasets
 import util.misc as utils
+from util.misc import get_cuda_memory_usage
 from util.lr_scheduler import WarmupMultiStepLR
 import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
@@ -135,6 +137,8 @@ def main(args):
     dataset_val = build_dataset(image_set='val', args=args)
     dataset_support = build_support_dataset(image_set=image_set, args=args)
 
+    logging.debug("{} After building.".format(get_cuda_memory_usage()))
+
     if args.distributed:
         if args.cache_mode:
             sampler_train = samplers.NodeDistributedSampler(dataset_train)
@@ -156,6 +160,7 @@ def main(args):
                               collate_fn=utils.collate_fn,
                               num_workers=args.num_workers,
                               pin_memory=True)
+    logging.debug("{} After TRAIN loader.".format(get_cuda_memory_usage()))
 
     loader_val = DataLoader(dataset_val,
                             batch_size=args.batch_size,
@@ -164,6 +169,7 @@ def main(args):
                             collate_fn=utils.collate_fn,
                             num_workers=args.num_workers,
                             pin_memory=True)
+    logging.debug("{} After VAL loader.".format(get_cuda_memory_usage()))
 
     loader_support = DataLoader(dataset_support,
                                 batch_size=1,
@@ -171,6 +177,7 @@ def main(args):
                                 drop_last=False,
                                 num_workers=args.num_workers,
                                 pin_memory=False)
+    logging.debug("{} After SUPPORT loader.".format(get_cuda_memory_usage()))
 
     def match_name_keywords(n, name_keywords):
         out = False
@@ -236,7 +243,7 @@ def main(args):
         model_without_ddp = model.module
 
     if args.dataset_file == "coco_panoptic":
-        # We also evaluate AP during panoptic training, on original coco DS
+        # We also evaluate AP during panoptic training, on original coco DS9
         coco_val = datasets.dataset.build("val", args)
         base_ds = get_coco_api_from_dataset(coco_val)
     else:
@@ -285,6 +292,8 @@ def main(args):
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval_novel.pth")
 
         return
+    
+    logging.debug("{} {}.".format(get_cuda_memory_usage(), "Before training."))
 
     print("Start training...")
     start_time = time.time()
@@ -359,9 +368,15 @@ def main(args):
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
     parser = argparse.ArgumentParser('Meta-DETR', parents=[get_args_parser()])
     args = parser.parse_args()
     assert args.max_pos_support <= args.total_num_support
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    # import torch.multiprocessing
+    # torch.multiprocessing.set_sharing_strategy('file_system')
+
+    # torch.cuda.memory._record_memory_history(enabled=True)
     main(args)
+    # torch.cuda.memory._save_memory_usage()

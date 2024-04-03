@@ -7,7 +7,7 @@ from torch.nn.init import xavier_uniform_, constant_, normal_
 
 from models.attention import SingleHeadSiameseAttention
 from models.ops.modules import MSDeformAttn
-from util.misc import inverse_sigmoid
+from util.misc import inverse_sigmoid, mem_info_logger
 
 
 class DeformableTransformer(nn.Module):
@@ -24,6 +24,7 @@ class DeformableTransformer(nn.Module):
         encoder_layers = nn.ModuleList()
         for i in range(num_encoder_layers):
             encoder_layers.append(
+                # Do the QSAttn only at the first encoder layer.
                 DeformableTransformerEncoderLayer(d_model, dim_feedforward,
                                                   dropout, activation,
                                                   num_feature_levels, nhead, enc_n_points, QSAttn=(i == 0))
@@ -118,6 +119,10 @@ class DeformableTransformer(nn.Module):
         return hs, init_reference_out, inter_references_out, encoder_outputs
 
     def forward_supp_branch(self, srcs, masks, pos_embeds, query_embed, tsp, support_boxes):
+        """
+        1. Adjust the shape of support features(src), masks and positional embedding.
+        2. Pass the support features and so on into the DeformableTransformerEncoder to get the output.
+        """
         assert query_embed is not None
 
         # prepare input for encoder
@@ -125,10 +130,13 @@ class DeformableTransformer(nn.Module):
         mask_flatten = []
         lvl_pos_embed_flatten = []
         spatial_shapes = []
+        # Actually, only one element in srcs / masks / pos_embeds, because there is only one feature level in actual performing.
+        # So the for-loop below performs just once.
         for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
-            bs, c, h, w = src.shape
+            bs, c, h, w = src.shape # (episode_size, class_num, height, width)
             spatial_shape = (h, w)
             spatial_shapes.append(spatial_shape)
+            # (bs, c, h, w) -> (bs, c, h * w) -> (bs, h * w, c)
             src = src.flatten(2).transpose(1, 2)
             mask = mask.flatten(1)
             pos_embed = pos_embed.flatten(2).transpose(1, 2)
@@ -139,10 +147,13 @@ class DeformableTransformer(nn.Module):
             lvl_pos_embed_flatten.append(lvl_pos_embed)
             src_flatten.append(src)
             mask_flatten.append(mask)
+        # Merge the features, (bs, h*w, c)[1] is h*w
         src_flatten = torch.cat(src_flatten, 1)
         mask_flatten = torch.cat(mask_flatten, 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
+        # spatial_shapes: (1, 2) --> [[H, W], ...]
         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
+        # TODO Try to understand next line.
         level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
 
@@ -207,26 +218,34 @@ class DeformableTransformerEncoderLayer(nn.Module):
         return src
 
     def forward_supp_branch(self, src, pos, reference_points, spatial_shapes, level_start_index, padding_mask, tsp, support_boxes):
+        """
+        
+        """
         # self attention
+        # src2: (episode_size, H*W, d_model)
         src2 = self.self_attn(self.with_pos_embed(src, pos), reference_points, src, spatial_shapes, level_start_index, padding_mask)
         src = src + self.dropout1(src2)
         src = self.norm1(src)
 
         support_img_h, support_img_w = spatial_shapes[0, 0], spatial_shapes[0, 1]
+        # torchvision.ops.roi_align actually perform RoI(Region of Interest) Align operator with average pooling.
         supp_roi = torchvision.ops.roi_align(
             src.transpose(1, 2).reshape(src.shape[0], -1, support_img_h, support_img_w),
             support_boxes,
             output_size=(7, 7),
             spatial_scale=1 / 32.0,
             aligned=True).mean(3).mean(2)
-        category_code = supp_roi.sigmoid()
+        # supp_roi: (episode_size, d_model)
+        category_code = supp_roi.sigmoid()  # after reshaping and catenating as value of single siamese attention in feature matching
 
         if self.QSAttn:
             # siamese attention
-            src, tsp = self.siamese_attn(src,
-                                         inverse_sigmoid(category_code).unsqueeze(0).expand(src.shape[0], -1, -1),
-                                         category_code.unsqueeze(0).expand(src.shape[0], -1, -1),
-                                         tsp)
+            src, tsp = self.siamese_attn(
+                src,
+                inverse_sigmoid(category_code).unsqueeze(0).expand(src.shape[0], -1, -1),
+                category_code.unsqueeze(0).expand(src.shape[0], -1, -1),
+                tsp
+            )   # both is (episode_size, H*W, d_model)
 
             # ffn
             src = self.forward_ffn(src + tsp)
@@ -264,11 +283,14 @@ class DeformableTransformerEncoder(nn.Module):
             output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask, category_codes[i], tsp)
         return output
 
+    @mem_info_logger("Forward Support Branch Cross Encoder")
     def forward_supp_branch(self, src, spatial_shapes, level_start_index, valid_ratios, pos, padding_mask, tsp, support_boxes):
+        # level_start_index and valid_ratios not need in single level feature training.
         output = src
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
         category_codes = []
         for i, layer in enumerate(self.layers):
+            layer: DeformableTransformerEncoderLayer
             output, category_code = layer.forward_supp_branch(
                 output, pos, reference_points, spatial_shapes, level_start_index, padding_mask, tsp, support_boxes
             )

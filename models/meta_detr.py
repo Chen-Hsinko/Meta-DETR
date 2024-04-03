@@ -1,18 +1,19 @@
 import copy
 import math
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.weight_norm import WeightNorm
 
 from util import box_ops
-from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
-                       accuracy, get_world_size, is_dist_avail_and_initialized, inverse_sigmoid)
+from util.misc import (NestedTensor, nested_tensor_from_tensor_list, mem_info_logger,
+                       accuracy, get_world_size, is_dist_avail_and_initialized, inverse_sigmoid, get_cuda_memory_usage)
 
 from .backbone import build_backbone
 from .matcher import build_matcher
 from .deformable_transformer import build_deforamble_transformer
-from .deformable_transformer import DeformableTransformerDecoderLayer, DeformableTransformerDecoder
+from .deformable_transformer import DeformableTransformer, DeformableTransformerDecoderLayer, DeformableTransformerDecoder
 from .position_encoding import TaskPositionalEncoding, QueryEncoding
 
 
@@ -30,6 +31,7 @@ class distLinear(nn.Module):
         self.scale_factor = 10
 
     def forward(self, x):
+        # p=2 norm equivalent to Frobenius norm, ie square opening on the sum of each element squared.
         x_norm = torch.norm(x, p=2, dim=1).unsqueeze(1).expand_as(x)
         x_normalized = x.div(x_norm + 0.00001)
         if not self.class_wise_learnable_norm:
@@ -59,10 +61,11 @@ class MetaDETR(nn.Module):
         self.hidden_dim = args.hidden_dim
         self.num_feature_levels = num_feature_levels
 
-        self.transformer = transformer
+        self.transformer: DeformableTransformer = transformer  # Deformable Transformer
         self.task_positional_encoding = TaskPositionalEncoding(self.hidden_dim, dropout=0., max_len=self.args.episode_size)
         self.class_embed = nn.Linear(self.hidden_dim, self.args.episode_size)
         self.bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 4, 3)
+        # TODO How to understand category_codes_cls_loss here.
         if args.category_codes_cls_loss:
             if num_feature_levels == 1:
                 self.category_codes_cls = distLinear(self.hidden_dim, self.num_classes)
@@ -79,6 +82,8 @@ class MetaDETR(nn.Module):
         qe = queryencoding()
         self.query_embed = torch.cat([qe, qe], dim=1)
 
+
+        # Actually, process of num_feature_levels > 1 unimplemented.
         if self.num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
             input_proj_list = []
@@ -115,6 +120,7 @@ class MetaDETR(nn.Module):
             nn.init.constant_(proj[0].bias, 0)
 
         assert args.hidden_dim == self.hidden_dim
+        # The actual decoder layer.
         decoder_layer = DeformableTransformerDecoderLayer(args.hidden_dim,
                                                           args.dim_feedforward,
                                                           args.dropout,
@@ -129,6 +135,7 @@ class MetaDETR(nn.Module):
 
         num_pred = self.meta_decoder.num_layers
         if with_box_refine:
+            # Actually, unimplemented.
             self.class_embed = _get_clones(self.class_embed, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
@@ -139,6 +146,7 @@ class MetaDETR(nn.Module):
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
 
+    @mem_info_logger("Meta-DETR")
     def forward(self, samples, targets=None, supp_samples=None, supp_class_ids=None, supp_targets=None, category_codes=None):
 
         if not isinstance(samples, NestedTensor):
@@ -157,7 +165,10 @@ class MetaDETR(nn.Module):
             support_batchsize = self.args.episode_size
             assert num_support == (self.args.episode_size * self.args.episode_num)
             num_episode = self.args.episode_num
+
+            logging.debug("{} {}.".format(get_cuda_memory_usage(), "Before compute category codes."))
             category_codes = self.compute_category_codes(supp_samples, supp_targets)
+            logging.debug("{} {}.".format(get_cuda_memory_usage(), "After compute category codes."))
         # During inference, category_codes should be provided and ready to use for all activated categories
         else:
             assert category_codes is not None
@@ -166,7 +177,9 @@ class MetaDETR(nn.Module):
             num_support = supp_class_ids.shape[0]
             support_batchsize = self.args.episode_size
             num_episode = math.ceil(num_support / support_batchsize)
-
+        
+        # out_channels is the output channels of resnet.
+        # features: (batch_size, out_channels, H, W)
         features, pos = self.backbone(samples)
 
         srcs = []
@@ -199,8 +212,8 @@ class MetaDETR(nn.Module):
 
         for i in range(num_episode):
 
-            if self.num_feature_levels == 1:
-                if (support_batchsize * (i + 1)) <= num_support:
+            if self.num_feature_levels == 1:    # support_batch_size is episode_size
+                if (support_batchsize * (i + 1)) <= num_support:    # cc[?]: (batch_size, support_batch_size, d_model), len(cc) is number of encoder layer
                     cc = [c[(support_batchsize * i): (support_batchsize * (i + 1)), :].unsqueeze(0).expand(batchsize, -1, -1) for c in category_codes]
                     episode_class_ids = supp_class_ids[(support_batchsize * i): (support_batchsize * (i + 1))]
                 else:
@@ -218,6 +231,7 @@ class MetaDETR(nn.Module):
             (memory, spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten, tgt) = encoder_outputs
 
             # Category-agnostic transformer decoder
+            logging.debug("{} {}".format(get_cuda_memory_usage(), "Before meta decoder."))
             hs, inter_references = self.meta_decoder(
                 tgt,
                 init_reference,
@@ -228,18 +242,19 @@ class MetaDETR(nn.Module):
                 query_embed,
                 mask_flatten,
             )
-
+            logging.debug("{} {}".format(get_cuda_memory_usage(), "After meta decoder."))
+            
             # Final FFN to predict confidence scores and boxes coordinates
             outputs_classes = []
             outputs_coords = []
-            for lvl in range(hs.shape[0]):
+            for lvl in range(hs.shape[0]):  # hs: (enc_layers, batch_size, num_queries, d_model)
                 if lvl == 0:
                     reference = init_reference.reshape(batchsize, self.num_queries, 2)
                 else:
                     reference = inter_references[lvl - 1]
                 reference = inverse_sigmoid(reference)
-                outputs_class = self.class_embed[lvl](hs[lvl])
-                tmp = self.bbox_embed[lvl](hs[lvl])
+                outputs_class = self.class_embed[lvl](hs[lvl])  # (batch_size, num_queries, support_batch_size)
+                tmp = self.bbox_embed[lvl](hs[lvl]) # (batch_size, num_queries, 4)
                 if reference.shape[-1] == 4:
                     tmp += reference
                 else:
@@ -320,35 +335,82 @@ class MetaDETR(nn.Module):
                 aux_output['activated_class_ids'] = torch.stack(meta_support_class_ids).unsqueeze(0).expand(batchsize, -1, -1).reshape(batchsize * num_episode, -1)
         return out
 
+    @mem_info_logger('Compute Category Codes')
     def compute_category_codes(self, supp_samples, supp_targets):
+        """
+        Performed to process support features in training.
+
+        Returns:
+            final_category_list (List[Tensor]): contains output of every encoder layer.
+
+        1. Produce the support features and positional encoding by backbone.
+        2. Decompose features(NestedTensor) to get features and mask.
+        3. Convert box from (cx, cy, w, h) to (ltx, lty, rbx, rby) and from relative [0, 1] to absolute [0, width/height], in which lt means left-top and rb means right-bottom.
+        4. Put the query embeds on the same device with support features.
+        5. Get the task positional encoding according to the episode size and hidden dimension. Actual size: (num_supp, episode_size, hidden_dim).
+        6. Do the transformer encoding with support features, masks and query embedding.
+        7. Note that, 
+            - the length of output is the number of the encoder layers.
+            - actually, every encoder layer does the multi-head self-attention and RoI-Align operator with Average-Pooling at support features which is part of CAM(Correlational Aggregation Module). More refer to [Meta-DETR](https://arxiv.org/abs/2103.11731).
+        """
+        # The number of support samples, actually is the batchsize of support branch, 
+        #   i.e. the number of categories. For example, it's 25 for voc_base1.
+        #TODO explaination above is wrong.
         num_supp = supp_samples.tensors.shape[0]
 
         if self.num_feature_levels == 1:
+            # Get the features produced by the first three layers
+            #   (because return_interm_layers is False) of feature extractor(resnet here) 
+            #   and its corresponding positional encoding.
+            logging.debug("{} {}".format(get_cuda_memory_usage(), "Before backbone forward support branch."))
+            # Suppose n is episode_num * episode_size.
+            # features[0].tensors.shape: (N, channels, H, W)
+            # feautres[0].mask.shape: (N, H, W)
+            # pos[0].shape: (N, d_model, H, W)
             features, pos = self.backbone.forward_supp_branch(supp_samples, return_interm_layers=False)
-            srcs = []
-            masks = []
+            logging.debug("{} {}".format(get_cuda_memory_usage(), "After backbone forward support branch."))
+            srcs = []   # support features stored here.
+            masks = []  # support masks stored here.
             for l, feat in enumerate(features):
                 src, mask = feat.decompose()
+                # Actually, self.input_proj here is just a list with only one single element, 
+                #   due to the num_feature_levels equals 1 
+                #   which can refer to the definition in __init__.
                 srcs.append(self.input_proj[l](src))
                 masks.append(mask)
                 assert mask is not None
+            # So, after operation above, both srcs and masks only have one element.
 
+            # (cx, cy, w, h) -> (ltx, lty, rbx, rby),
+            # lt: left top, rb: right bottom
             boxes = [box_ops.box_cxcywh_to_xyxy(t['boxes']) for t in supp_targets]
             # and from relative [0, 1] to absolute [0, height] coordinates
             img_sizes = torch.stack([t["size"] for t in supp_targets], dim=0)
-            img_h, img_w = img_sizes.unbind(1)
-            scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+            img_h, img_w = img_sizes.unbind(1)  # Here, gets hights and weight of all samples, and each part is a single one-dimension tensor.
+            scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)    # scale factor
             for b in range(num_supp):
                 boxes[b] *= scale_fct[b]
+            # For now, get the actual bbox coordinates.
 
             query_embeds = self.query_embed.to(src.device)
 
+            # torch.expand: Expand the tensor along the given dimension, but all slices in that dimension share the data in the same memory.
+            # (num_supp, self.episode_size, self.hidden_dim)
             tsp = self.task_positional_encoding(torch.zeros(self.args.episode_size, self.hidden_dim, device=src.device)).unsqueeze(0).expand(num_supp, -1, -1)
 
             category_codes_list = list()
 
+            # ??? How to understand codes below? 
+            #   --> OK, well, episode size here is the number of support samples used per episode.
+            #   --> So, num_supp // self.args.episode_size is just the times of episode per iteration.
+            # Each training iteration perform several episodes which mimics N-way-K-shot setting.
+            # In each episode e the model is trained on K training examples of N categories on the random subset meta dataset 
+            #   which included by the base dataset.
+            # Forward the support branch, actually through the transformer.
+            # Note that, num_supp // self.args.episode_size equals self.args.episode_num
             for i in range(num_supp // self.args.episode_size):
                 category_codes_list.append(
+                    # Only do the transformer encoding, but actually including part of CAM.
                     self.transformer.forward_supp_branch([srcs[0][i*self.args.episode_size: (i+1)*self.args.episode_size]],
                                                          [masks[0][i*self.args.episode_size: (i+1)*self.args.episode_size]],
                                                          [pos[0][i*self.args.episode_size: (i+1)*self.args.episode_size]],
@@ -359,9 +421,10 @@ class MetaDETR(nn.Module):
 
             final_category_codes_list = []
             for i in range(self.args.enc_layers):
+                # Catenate the support features in the same layer.
                 final_category_codes_list.append(
                     torch.cat([ccl[i] for ccl in category_codes_list], dim=0)
-                )
+                )   # (episode_size*episode_num, d_model)
 
             return final_category_codes_list
 
@@ -647,7 +710,9 @@ def build(args):
 
     device = torch.device(args.device)
 
+    # Actually, backbone is Jointer, ie [backbone, postional_encoding]
     backbone = build_backbone(args)
+    # Actually, transformer here just builds the encoder with the first encoder layer having the siamese attention layer.
     transformer = build_deforamble_transformer(args)
     model = MetaDETR(
         args,
@@ -663,10 +728,11 @@ def build(args):
     matcher = build_matcher(args)
 
     weight_dict = dict()
-    weight_dict['loss_ce'] = args.cls_loss_coef
-    weight_dict['loss_bbox'] = args.bbox_loss_coef
-    weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict['loss_ce'] = args.cls_loss_coef # cross entropy loss
+    weight_dict['loss_bbox'] = args.bbox_loss_coef  # 
+    weight_dict['loss_giou'] = args.giou_loss_coef  # generalized iou
 
+    # auxilary loss, here actually is the losses of every transformer layers except the last decoder layer.
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):

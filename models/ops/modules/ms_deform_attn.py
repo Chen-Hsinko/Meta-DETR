@@ -77,7 +77,7 @@ class MSDeformAttn(nn.Module):
 
     def forward(self, query, reference_points, input_flatten, input_spatial_shapes, input_level_start_index, input_padding_mask=None):
         """
-        :param query                       (N, Length_{query}, C)
+        :param query                       (N, Length_{query}, C)   !!! Here seem something wrong, should be (N, Length_{query}, d_model)
         :param reference_points            (N, Length_{query}, n_levels, 2), range in [0, 1], top-left (0,0), bottom-right (1, 1), including padding area
                                         or (N, Length_{query}, n_levels, 4), add additional (w, h) to form reference boxes
         :param input_flatten               (N, \sum_{l=0}^{L-1} H_l \cdot W_l, C)
@@ -111,5 +111,6 @@ class MSDeformAttn(nn.Module):
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
         output = MSDeformAttnFunction.apply(
             value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
+        # output: (episode_size, H*W, d_model)
         output = self.output_proj(output)
         return output

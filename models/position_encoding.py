@@ -96,9 +96,11 @@ class TaskPositionalEncoding(nn.Module):
                              -(math.log(10000.0) / d_model))
         tpe[:, 0::2] = torch.sin(position * div_term)
         tpe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('tpe', tpe)
+        # Buffer is not a model parameter, but part of module's state. 
+        self.register_buffer('tpe', tpe)    # Set up self.tpe
 
     def forward(self, x):
+        # torch.flip: Reverse the order of an n-D tensor along given axis in dims.
         x = x + torch.flip(Variable(self.tpe[:x.size(1)], requires_grad=False), [1])
         return self.dropout(x)
 

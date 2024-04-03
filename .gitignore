@@ -1,3 +1,16 @@
+model.pth
+ToLearn.md
+ToDo.md
+notes.md
+.vscode/
+
+# datasets
+/data/coco
+/data/voc
+
+# exps
+exps/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

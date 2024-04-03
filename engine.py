@@ -1,11 +1,13 @@
 import sys
 import math
 import random
+import logging
 import itertools
 from typing import Iterable
 
 import torch
 import util.misc as utils
+from util.misc import get_cuda_memory_usage
 from datasets.eval_detection import DetectionEvaluator
 from datasets import (coco_base_class_ids, coco_novel_class_ids, \
                       voc_base1_class_ids, voc_novel1_class_ids, \
@@ -17,11 +19,20 @@ from datasets import (coco_base_class_ids, coco_novel_class_ids, \
 def sample_support_categories(args, targets, support_images, support_class_ids, support_targets):
     """
     This function is used during training. It does the followings:
+
+    Parameters:
+        support_class_ids (Tensor[int]): Only one dimension, records all the categories existed.
+    
     1. Samples the support categories (total num: args.total_num_support; maximum positive num: args.max_pos_support)
        (Insufficient positive support categories will be replaced with negative support categories.)
     2. Filters ground truths of the query images.
        We only keep ground truths whose labels are sampled as support categories.
     3. Samples and pre-processes support_images, support_class_ids, and support_targets.
+    4. Note that,
+        - This method tries best to choose from the support_class_ids for the different categories.
+        - Each time choose episode_size categories for episode_num times.
+        - So, finally, size of the support images is episode_size * episode_num.
+        - More importantly, some images will appear several times, because of the sequential process of the episode_size support images each time. 
     """
     support_images = list(itertools.chain(*support_images))
     support_class_ids = torch.cat(support_class_ids, dim=0).tolist()
@@ -96,16 +107,20 @@ def train_one_epoch(args,
         # * Sample Support Categories;
         # * Filters Targets (only keep GTs within support categories);
         # * Samples Support Images and Targets
+        logging.debug("{} {}.".format(get_cuda_memory_usage(), "Before sampling support categories."))
         targets, support_images, support_class_ids, support_targets = \
             sample_support_categories(args, targets, support_images, support_class_ids, support_targets)
-
+        logging.debug("{} {}.".format(get_cuda_memory_usage(), "After sampling support categories."))
+        
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
         support_images = support_images.to(device)
         support_class_ids = support_class_ids.to(device)
         support_targets = [{k: v.to(device) for k, v in t.items()} for t in support_targets]
-
+        
+        logging.debug("{} {}.".format(get_cuda_memory_usage(), "Before forwarding."))
         outputs = model(samples, targets=targets, supp_samples=support_images, supp_class_ids=support_class_ids, supp_targets=support_targets)
+        logging.debug("{} {}.".format(get_cuda_memory_usage(), "After forwarding."))
         loss_dict = criterion(outputs)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)

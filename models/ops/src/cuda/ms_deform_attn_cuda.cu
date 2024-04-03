@@ -10,7 +10,6 @@
 
 #include <vector>
 #include "cuda/ms_deform_im2col_cuda.cuh"
-
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>

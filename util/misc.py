@@ -18,7 +18,8 @@ from torch import Tensor
 
 # needed due to empty tensor bug in pytorch and torchvision 0.5
 import torchvision
-if float(torchvision.__version__[:3]) < 0.5:
+# 这里是一个 Bug，例如 "0.14.0"[:3] = "0.1"，原本目的应该是进行一个版本判断，此处错误
+if float(torchvision.__version__[2:4]) < 5:
     import math
     from torchvision.ops.misc import _NewEmptyTensorOp
     def _check_size_scale_factor(dim, size, scale_factor):
@@ -45,7 +46,8 @@ if float(torchvision.__version__[:3]) < 0.5:
         return [
             int(math.floor(input.size(i + 2) * scale_factors[i])) for i in range(dim)
         ]
-elif float(torchvision.__version__[:3]) < 0.7:
+# 这里是一个 Bug，例如 "0.14.0"[:3] = "0.1"，原本目的应该是进行一个版本判断，此处错误
+elif float(torchvision.__version__[2:4]) < 7:
     from torchvision.ops import _new_empty_tensor
     from torchvision.ops.misc import _output_size
 
@@ -310,7 +312,7 @@ class NestedTensor(object):
         self.mask = mask
 
     def to(self, device, non_blocking=False):
-        # type: (Device) -> NestedTensor # noqa
+        # type (Device) NestedTensor # noqa
         cast_tensor = self.tensors.to(device, non_blocking=non_blocking)
         mask = self.mask
         if mask is not None:
@@ -455,7 +457,8 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
     This will eventually be supported natively by PyTorch, and this
     class can go away.
     """
-    if float(torchvision.__version__[:3]) < 0.7:
+    # 这里是一个 Bug，例如 "0.14.0"[:3] = "0.1"，原本目的应该是进行一个版本判断，此处错误
+    if float(torchvision.__version__[2:4]) < 7:
         if input.numel() > 0:
             return torch.nn.functional.interpolate(
                 input, size, scale_factor, mode, align_corners
@@ -463,7 +466,8 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
 
         output_shape = _output_size(2, input, size, scale_factor)
         output_shape = list(input.shape[:-2]) + list(output_shape)
-        if float(torchvision.__version__[:3]) < 0.5:
+        # 这里是一个 Bug，例如 "0.14.0"[:3] = "0.1"，原本目的应该是进行一个版本判断，此处错误
+        if float(torchvision.__version__[2:4]) < 5:
             return _NewEmptyTensorOp.apply(input, output_shape)
         return _new_empty_tensor(input, output_shape)
     else:
@@ -484,3 +488,77 @@ def inverse_sigmoid(x, eps=1e-6):  # TODO: original 1e-5
     x1 = x.clamp(min=eps)
     x2 = (1 - x).clamp(min=eps)
     return torch.log(x1/x2)
+
+
+def get_cuda_memory_usage():
+    GB = 1024 * 1024 * 1024
+    free, total = torch.cuda.mem_get_info()
+    return f"CUDA Memory: {free/GB:.2}GB free, {total/GB:.2}GB total."
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Two ways to implement memory info logger >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+import functools
+import logging
+
+def get_cuda_mem_info():
+    GB = 1024.0**3
+    free, total = torch.cuda.mem_get_info()
+    return free / GB, total / GB
+
+
+from typing import Callable, Any, TypeVar
+from .beauty import colored_str
+FuncType = Callable[..., Any]
+F = TypeVar('F', bound=FuncType)
+
+
+class MemLogger:
+    def __init__(self, name):
+        self.name = name
+    
+    def __call__(self, fn: F):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            logging.debug("CUDA Memory: {:.2f}/{:.2f} (free/total) before {} performing.".format(*get_cuda_mem_info(), self.name))
+            output = fn(*args, **kwargs)
+            logging.debug("CUDA Memory: {:.2f}/{:.2f} (free/total) after {} performing.".format(*get_cuda_mem_info(), self.name))
+            return output
+        return wrapper
+    
+
+def mem_info_logger(name):
+    """Use closure and decorator."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            logging.debug("CUDA Memory: {:.2f}/{:.2f} (free/total) before {} performing.".format(
+                *get_cuda_mem_info(), colored_str(name)))
+            output = fn(*args, **kwargs)
+            logging.debug("CUDA Memory: {:.2f}/{:.2f} (free/total) after {} performing.".format(
+                *get_cuda_mem_info(), colored_str(name)))
+            return output
+        return wrapper
+    return decorator
+
+
+"""
+# Codes for test
+
+logging.basicConfig(level=logging.DEBUG)
+
+@MemLogger("example1")
+def example1(s="Bob"):
+    print(f"Hello {s}, here is in example.")
+
+    
+@mem_info_logger("example2")
+def example2(s="Bob"):
+    print(f"Hello {s}, here is in example1.")
+
+    
+example("Hsinko")
+example2("Chen")
+"""
+
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< Two ways to implement memory info logger <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<

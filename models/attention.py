@@ -51,20 +51,30 @@ class SingleHeadSiameseAttention(nn.Module):
 
         tsp = tsp.view(sz_b, len_v, self.n_head, self.d_model)
 
+        # sz_b is just episode size.
+        # The shape of dummy is (sz_b, 1, self.n_head, self.d_model)
+        # Actually, dummy here is the Background-Prototype which is learnable.
         dummy = self.dummy.reshape(1, 1, 1, self.d_model).expand(sz_b, -1, self.n_head, -1)
         dummy_v = torch.zeros(sz_b, 1, self.n_head, self.d_model, device=v.device)
+        # Actually, dummy_v here is the Background-Encoding.
 
-        k = torch.cat([k, dummy], dim=1)
-        v = torch.cat([v, dummy_v], dim=1)
-        tsp = torch.cat([tsp, dummy_v], dim=1)
+        k = torch.cat([k, dummy], dim=1)    # shape is (sz_b, len_k + 1, self.n_head, self.d_model)
+        v = torch.cat([v, dummy_v], dim=1)  # shape is (sz_b, len_v + 1, self.n_head, self.d_model)
+        tsp = torch.cat([tsp, dummy_v], dim=1)  # shape is (sz_b, len_v + 1, self.n_head, self.d_model)
 
         q = q.permute(2, 0, 1, 3).contiguous().view(-1, len_q, self.d_model)  # (n_head * b) x lq x d_model
         k = k.permute(2, 0, 1, 3).contiguous().view(-1, len_k + 1, self.d_model)  # (n_head * b) x lk x d_model
         v = v.permute(2, 0, 1, 3).contiguous().view(-1, len_v + 1, self.d_model)  # (n_head * b) x lv x d_model
         tsp = tsp.permute(2, 0, 1, 3).contiguous().view(-1, len_v + 1, self.d_model)  # (n_head * b) x lv x d_model
 
-        output, attn, log_attn = self.attention(q, k, v)
-        tsp, _, _ = self.attention(q, k, tsp)
+        # torch.Tensor.contiguous returns a contiguous in memory tensor containing the same data as self tensor.
+        #   Actually, if the new tensor has already meet the need, there will be no changes, otherwise,
+        #       contiguous method will create a new tensor contiguous in memory with the same data.
+        #   Here, due to permution, a new tensor is created actually.
+        # The data still keeps original format information due to the permute operation.
+        # After permution, shape is (self.n_head, sz_b, len, self.d_model)
+        output, attn, log_attn = self.attention(q, k, v)    # (episode_size, H*W, d_model)
+        tsp, _, _ = self.attention(q, k, tsp)   # (episode_size, H*W, d_model)
 
         output = output.view(self.n_head, sz_b, len_q, self.d_model)
         output = output.permute(1, 2, 0, 3).contiguous().view(sz_b, len_q, -1)  # b x lq x (n_head * d_model)
