@@ -236,7 +236,7 @@ class MetricLogger(object):
                 '{meters}',
                 'time: {time}',
                 'data: {data}',
-                'max mem: {memory:.0f}'
+                'max mem: {memory:.2f}GB'
             ])
         else:
             log_msg = self.delimiter.join([
@@ -248,6 +248,7 @@ class MetricLogger(object):
                 'data: {data}'
             ])
         MB = 1024.0 * 1024.0
+        GB = 1024.0 ** 3
         for obj in iterable:
             data_time.update(time.time() - end)
             yield obj
@@ -260,7 +261,7 @@ class MetricLogger(object):
                         i, len(iterable), eta=eta_string,
                         meters=str(self),
                         time=str(iter_time), data=str(data_time),
-                        memory=torch.cuda.max_memory_allocated() / MB))
+                        memory=torch.cuda.max_memory_allocated() / GB))
                 else:
                     print(log_msg.format(
                         i, len(iterable), eta=eta_string,

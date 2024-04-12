@@ -153,6 +153,7 @@ class BackboneBase(nn.Module):
 
     @mem_info_logger('Support Encoding Net of Backbone')
     def support_encoding_net(self, x, return_interm_layers=False):
+        # TODO Codes below is not so good.
         out: Dict[str, NestedTensor] = {}
         self.backbone: torchvision.models.ResNet
         m = x.mask
@@ -162,8 +163,8 @@ class BackboneBase(nn.Module):
         x = self.backbone.relu(x)
         x = self.backbone.maxpool(x)
         x = self.backbone.layer1(x)
-        # self.backbone.layer2(x)
-        x = mem_info_logger('Backbone-Layer2')(self.backbone.layer2)(x) # TODO delete it, just for testing memory here.
+        
+        x = self.backbone.layer2(x)
         if return_interm_layers:
             mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
             out['0'] = NestedTensor(x, mask)
