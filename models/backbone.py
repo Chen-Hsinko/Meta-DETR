@@ -6,108 +6,71 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 import torchvision
+from torchvision.ops import FrozenBatchNorm2d
 from torchvision.models._utils import IntermediateLayerGetter
 
 from util.misc import NestedTensor, is_main_process, get_cuda_memory_usage, mem_info_logger
 
 from .position_encoding import build_position_encoding
+from .efficientdet import BiFPN
 
 
 from types import FunctionType
 
 
-def _log_api_usage_once(obj: Any) -> None:
-
-    """
-    Logs API usage(module and name) within an organization.
-    In a large ecosystem, it's often useful to track the PyTorch and
-    TorchVision APIs usage. This API provides the similar functionality to the
-    logging module in the Python stdlib. It can be used for debugging purpose
-    to log which methods are used and by default it is inactive, unless the user
-    manually subscribes a logger via the `SetAPIUsageLogger method <https://github.com/pytorch/pytorch/blob/eb3b9fe719b21fae13c7a7cf3253f970290a573e/c10/util/Logging.cpp#L114>`_.
-    Please note it is triggered only once for the same API call within a process.
-    It does not collect any data from open-source users since it is no-op by default.
-    For more information, please refer to
-    * PyTorch note: https://pytorch.org/docs/stable/notes/large_scale_deployments.html#api-usage-logging;
-    * Logging policy: https://github.com/pytorch/vision/issues/5052;
-
-    Args:
-        obj (class instance or method): an object to extract info from.
-    """
-    module = obj.__module__
-    if not module.startswith("torchvision"):
-        module = f"torchvision.internal.{module}"
-    name = obj.__class__.__name__
-    if isinstance(obj, FunctionType):
-        name = obj.__name__
-    torch._C._log_api_usage_once(f"{module}.{name}")
-
-
-class FrozenBatchNorm2d(torch.nn.Module):
-    """
-    BatchNorm2d where the batch statistics and the affine parameters are fixed
-
-    Args:
-        num_features (int): Number of features ``C`` from an expected input of size ``(N, C, H, W)``
-        eps (float): a value added to the denominator for numerical stability. Default: 1e-5
-    """
-
-    def __init__(
-        self,
-        num_features: int,
-        eps: float = 1e-5,
-    ):
+class ResNetBiFPN(nn.Module):
+    def __init__(self, phi):
         super().__init__()
-        _log_api_usage_once(self)
-        self.register_buffer("weight", torch.ones(num_features))
-        self.register_buffer("bias", torch.zeros(num_features))
-        self.register_buffer("running_mean", torch.zeros(num_features))
-        self.register_buffer("running_var", torch.ones(num_features))
-        self.eps = eps
+        #--------------------------------#
+        self.phi = phi
+        #---------------------------------------------------#
+        #   backbone_phi指的是该efficientdet对应的efficient
+        #---------------------------------------------------#
+        self.backbone_phi = [0, 1, 
+                             2, 3, 4, 5, 6, 6
+                             ]
+        #--------------------------------#
+        #   BiFPN所用的通道数
+        #--------------------------------#
+        self.fpn_num_filters = [256, 384, 
+                                512, 640, 768, 768
+                                ]
+        #--------------------------------#
+        #   BiFPN的重复次数
+        #--------------------------------#
+        self.fpn_cell_repeats = [3, 4, 
+                                 5, 6, 7, 7, 8, 8
+                                 ]
+        #---------------------------------------------------#
+        conv_channel_coef = {
+            0: [512, 1024, 2048],
+            1: [512, 1024, 2048],
+            # 2: [48, 120, 352],
+            # 3: [48, 136, 384],
+            # 4: [56, 160, 448],
+            # 5: [64, 176, 512],
+            # 6: [72, 200, 576],
+            # 7: [72, 200, 576],
+        }
 
-    def _load_from_state_dict(
-        self,
-        state_dict: dict,
-        prefix: str,
-        local_metadata: dict,
-        strict: bool,
-        missing_keys: List[str],
-        unexpected_keys: List[str],
-        error_msgs: List[str],
-    ):
-        num_batches_tracked_key = prefix + "num_batches_tracked"
-        if num_batches_tracked_key in state_dict:
-            del state_dict[num_batches_tracked_key]
-
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        # move reshapes to the beginning
-        # to make it fuser-friendly
-        w = self.weight.reshape(1, -1, 1, 1)
-        logging.debug("{} {}".format(get_cuda_memory_usage(), "After FrozenBatchNorm2d weight."))
-
-        b = self.bias.reshape(1, -1, 1, 1)
-        logging.debug("{} {}".format(get_cuda_memory_usage(), "After FrozenBatchNorm2d bias."))
-
-        rv = self.running_var.reshape(1, -1, 1, 1)
-        logging.debug("{} {}".format(get_cuda_memory_usage(), "After FrozenBatchNorm2d rv."))
-
-        rm = self.running_mean.reshape(1, -1, 1, 1)
-        logging.debug("{} {}".format(get_cuda_memory_usage(), "After FrozenBatchNorm2d rm."))
-        
-        scale = w * (rv + self.eps).rsqrt()
-        logging.debug("{} {}".format(get_cuda_memory_usage(), "After FrozenBatchNorm2d scale."))
-        
-        bias = b - rm * scale
-        logging.debug("{} {}".format(get_cuda_memory_usage(), "After FrozenBatchNorm2d bias."))
-        return x * scale + bias
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.weight.shape[0]}, eps={self.eps})"
-
+        #------------------------------------------------------#
+        #   在经过多次BiFPN模块的堆叠后，我们获得的fpn_features
+        #   假设我们使用的是efficientdet-D0包括五个有效特征层：
+        #   P3_out      64,64,64
+        #   P4_out      32,32,64
+        #   P5_out      16,16,64
+        #   P6_out      8,8,64
+        #   P7_out      4,4,64
+        #------------------------------------------------------#
+        self.bifpn = nn.Sequential(
+            *[BiFPN(self.fpn_num_filters[self.phi],
+                    conv_channel_coef[phi],
+                    True if _ == 0 else False,
+                    attention=True if phi < 6 else False)
+              for _ in range(self.fpn_cell_repeats[phi])])
+    
+    def forward(self, features):
+        return self.bifpn(features)
 
 
 class BackboneBase(nn.Module):
@@ -115,6 +78,7 @@ class BackboneBase(nn.Module):
         super().__init__()
         self.args = args
         self.backbone= backbone
+        self.return_interm_layers = return_interm_layers
 
         # Settings for freezing backbone
         assert 0 <= args.freeze_backbone_at_layer <= 4
@@ -141,62 +105,57 @@ class BackboneBase(nn.Module):
             else:
                 raise RuntimeError
 
-        if return_interm_layers:
-            return_layers = {"layer2": "0", "layer3": "1", "layer4": "2"}
-            self.strides = [8, 16, 32]
-            self.num_channels = [512, 1024, 2048]
-        else:
-            return_layers = {'layer4': "0"}
-            self.strides = [32]
-            self.num_channels = [2048]
-        self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
+        # if return_interm_layers:
+        #     return_layers = {"layer2": "0", "layer3": "1", "layer4": "2"}
+        #     self.strides = [8, 16, 32]
+        #     self.num_channels = [512, 1024, 2048]
+        # else:
+        #     return_layers = {'layer4': "0"}
+        #     self.strides = [32]
+        #     self.num_channels = [2048]
+        # self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
+        self.body = IntermediateLayerGetter(backbone, return_layers={"layer2": "0", "layer3": "1", "layer4": "2"})
+
+        self.bifpn = ResNetBiFPN(args.phi)
 
     @mem_info_logger('Support Encoding Net of Backbone')
-    def support_encoding_net(self, x, return_interm_layers=False):
-        # TODO Codes below is not so good.
+    def support_encoding_net(self, tensor_list):
         out: Dict[str, NestedTensor] = {}
-        self.backbone: torchvision.models.ResNet
-        m = x.mask
-        # x = self.meta_conv(x.tensors)
-        x = self.backbone.conv1(x.tensors)
-        x = self.backbone.bn1(x)
-        x = self.backbone.relu(x)
-        x = self.backbone.maxpool(x)
-        x = self.backbone.layer1(x)
+        xs = self.body(tensor_list.tensors)
+        xs = dict(zip(
+            ['P3', 'P4', 'P5', 'P6', 'P7'], 
+            self.bifpn(list(xs.values()))
+        ))
         
-        x = self.backbone.layer2(x)
-        if return_interm_layers:
-            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
-            out['0'] = NestedTensor(x, mask)
-
-        x = self.backbone.layer3(x) # TODO !!! Out of memory here.
-
-        if return_interm_layers:
-            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
-            out['1'] = NestedTensor(x, mask)
-
-        x = self.backbone.layer4(x)
-        if return_interm_layers:
-            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
-            out['2'] = NestedTensor(x, mask)
-
-        if return_interm_layers:
+        if self.return_interm_layers:
+            for name, x in xs.items():
+                m = tensor_list.mask
+                assert m is not None
+                mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
+                out[name] = NestedTensor(x, mask)
             return out
         else:
-            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
-            out['0'] = NestedTensor(x, mask)
+            mask = F.interpolate(m[None].float(), size=xs['P5'].shape[-2:]).to(torch.bool)[0]
+            out['0'] = NestedTensor(xs['P5'], mask)
             return out
+            
 
     @mem_info_logger('Backbone')
     def forward(self, tensor_list: NestedTensor):
         xs = self.body(tensor_list.tensors)
+        xs = dict(zip(['P3', 'P4', 'P5', 'P6', 'P7'], self.bifpn(list(xs.values()))))
         out: Dict[str, NestedTensor] = {}
-        for name, x in xs.items():
-            m = tensor_list.mask
-            assert m is not None
-            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
-            out[name] = NestedTensor(x, mask)
-        return out
+        if self.return_interm_layers:
+            for name, x in xs.items():
+                m = tensor_list.mask
+                assert m is not None
+                mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
+                out[name] = NestedTensor(x, mask)
+            return out
+        else:
+            mask = F.interpolate(m[None].float(), size=xs['P5'].shape[-2:]).to(torch.bool)[0]
+            out['0'] = NestedTensor(xs['P5'], mask)
+            return out
 
 
 class Backbone(BackboneBase):
@@ -208,8 +167,8 @@ class Backbone(BackboneBase):
                  args):
         self.args = args
         dilation = args.dilation
-        # norm_layer = FrozenBatchNorm2d
-        norm_layer = torch.nn.BatchNorm2d
+        norm_layer = FrozenBatchNorm2d
+        # norm_layer = torch.nn.BatchNorm2d
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
             pretrained=is_main_process(), norm_layer=norm_layer)
@@ -240,11 +199,11 @@ class Joiner(nn.Sequential):
         return out, pos
 
     @mem_info_logger('Support Branch of Joiner')
-    def forward_supp_branch(self, tensor_list: NestedTensor, return_interm_layers=False):
+    def forward_supp_branch(self, tensor_list: NestedTensor):
         # ! The next line gets the features produced by the feature extractor(resnet here).
         # ! return_interm_layers determine how many layers to use and how many out features produced.
         logging.debug("{} {}".format(get_cuda_memory_usage(), "Before backbone support encoding net."))
-        xs = self[0].support_encoding_net(tensor_list, return_interm_layers=return_interm_layers)
+        xs = self[0].support_encoding_net(tensor_list)
         logging.debug("{} {}".format(get_cuda_memory_usage(), "After backbone support encoding net."))
 
         out: List[NestedTensor] = []
@@ -262,7 +221,8 @@ class Joiner(nn.Sequential):
 def build_backbone(args):
     position_embedding = build_position_encoding(args)
     train_backbone = args.lr_backbone > 0
-    return_interm_layers = (args.num_feature_levels > 1)
+    # return_interm_layers = (args.num_feature_levels > 1)
+    return_interm_layers = args.masks
     backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args)
     model = Joiner(backbone, position_embedding)
     return model

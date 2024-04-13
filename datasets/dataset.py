@@ -198,7 +198,8 @@ def make_transforms(image_set):
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+    # scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+    scales = [384, 512, 640, 768, 896, 1024]
 
     if image_set == 'train':
         return T.Compose([
@@ -206,6 +207,11 @@ def make_transforms(image_set):
             T.RandomColorJitter(p=0.3333),
             T.RandomSelect(
                 T.RandomResize(scales, max_size=1152),
+                # T.Compose([
+                #     T.RandomResize([400, 500, 600]),
+                #     T.RandomSizeCrop(384, 600),
+                #     T.RandomResize(scales, max_size=1152),
+                # ])
                 T.Compose([
                     T.RandomResize([400, 500, 600]),
                     T.RandomSizeCrop(384, 600),
@@ -234,17 +240,26 @@ def make_support_transforms():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    scales = [448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672]
+    # scales = [448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672]
+    scales = [384, 512, 640, 768, 896, 1024]
 
     return T.Compose([
         T.RandomHorizontalFlip(),
         T.RandomColorJitter(p=0.25),
+        # T.RandomSelect(
+        #     T.RandomResize(scales, max_size=672),
+        #     T.Compose([
+        #         T.RandomResize([400, 500, 600]),
+        #         T.RandomSizeCrop(384, 600),
+        #         T.RandomResize(scales, max_size=672),
+        #     ])
+        # ),
         T.RandomSelect(
-            T.RandomResize(scales, max_size=672),
+            T.RandomResize(scales, max_size=1024),
             T.Compose([
                 T.RandomResize([400, 500, 600]),
                 T.RandomSizeCrop(384, 600),
-                T.RandomResize(scales, max_size=672),
+                T.RandomResize(scales, max_size=1024),
             ])
         ),
         normalize,

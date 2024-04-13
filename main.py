@@ -69,6 +69,7 @@ def get_args_parser():
     parser.add_argument('--num_feature_levels', default=1, type=int, help='number of feature levels, 1 or 4')
     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'))
     parser.add_argument('--position_embedding_scale', default=2 * np.pi, type=float, help="position / size * scale")
+    parser.add_argument('--phi', default=0, type=int, help="number of B, [0, 6]")
 
     # * Transformer
     parser.add_argument('--enc_layers', default=6, type=int, help="Number of encoding layers in transformer")
@@ -80,6 +81,10 @@ def get_args_parser():
     parser.add_argument('--num_queries', default=300, type=int, help="Number of query slots")
     parser.add_argument('--enc_n_points', default=4, type=int)
     parser.add_argument('--dec_n_points', default=4, type=int)
+
+    # * Segmentation
+    parser.add_argument('--masks', action='store_true',
+                        help="Train segmentation head if the flag is provided")
 
     # Loss
     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false', help="no aux loss @ each decoder layer")

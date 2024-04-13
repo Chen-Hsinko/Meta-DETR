@@ -360,7 +360,7 @@ class MetaDETR(nn.Module):
 
         if self.num_feature_levels == 1:
             # Get the features produced by the first three layers
-            #   (because return_interm_layers is False) of feature extractor(resnet here) 
+            #   (because return_interm_layers is False) of feature extractor(resnet here)
             #   and its corresponding positional encoding.
             logging.debug("{} {}".format(get_cuda_memory_usage(), "Before backbone forward support branch."))
             # Suppose n is episode_num * episode_size.
